@@ -1,0 +1,422 @@
+-- ============================================================
+-- AUTO REJOIN : doit être tout en haut, AVANT le chargement de Rayfield
+-- ============================================================
+local pl = game:GetService("Players")
+local lp = pl.LocalPlayer
+local PlaceId = game.PlaceId
+local JobId = game.JobId
+
+-- Configuration persistante (survit au rejoin via _G global si executor le supporte)
+-- On utilise un fichier pour être sûr que ça survit même après rejoin
+local HttpService = game:GetService("HttpService")
+local CONFIG_FILE = "auto_rejoin_config.json"
+
+local function saveConfig(tbl)
+	pcall(function()
+		writefile(CONFIG_FILE, HttpService:JSONEncode(tbl))
+	end)
+end
+
+local function loadConfig()
+	local ok, data = pcall(function()
+		return HttpService:JSONDecode(readfile(CONFIG_FILE))
+	end)
+	if ok and type(data) == "table" then
+		return data
+	end
+	return {}
+end
+
+local savedConfig = loadConfig()
+savedConfig.ScriptUrl = savedConfig.ScriptUrl or ""  -- à définir par toi
+
+-- Fonction de queue pour le rejoin
+local function requestRejoin()
+	local TeleportService = game:GetService("TeleportService")
+	local ts = game:GetService("TweenService")
+
+	-- Tentative de rejoin via TeleportToPlaceInstance (rejoint le MÊME serveur)
+	local success, err = pcall(function()
+		TeleportService:TeleportToPlaceInstance(PlaceId, JobId, lp)
+	end)
+
+	-- Si échec (ex: serveur plein / fermé), fallback sur Teleport normal
+	if not success then
+		pcall(function()
+			TeleportService:Teleport(PlaceId, lp)
+		end)
+	end
+end
+
+-- Détection des kicks / déconnexions
+-- On utilise plusieurs signaux pour être robuste
+local rejoinArmed = savedConfig.AutoRejoin == true
+
+-- 1. Détection via game:GetService("Players").PlayerRemoving (kick/déconnexion)
+-- Note : si on est kick, ce callback ne s'exécute pas toujours, donc on utilise
+-- aussi les erreurs et un heartbeat de check.
+
+local function armRejoin()
+	if not rejoinArmed then return end
+	savedConfig.AutoRejoin = true
+	saveConfig(savedConfig)
+	requestRejoin()
+end
+
+-- Détection de kick classique
+game:GetService("Players").PlayerRemoving:Connect(function(player)
+	if player == lp and rejoinArmed then
+		armRejoin()
+	end
+end)
+
+-- Détection via CoreGui / déconnexion (on écoute les erreurs)
+game:GetService("LogService").MessageOut:Connect(function(msg, msgType)
+	if not rejoinArmed then return end
+	local lower = string.lower(msg)
+	if lower:find("disconnect") or lower:find("kicked") or lower:find("you have been") then
+		armRejoin()
+	end
+end)
+
+-- Détection de perte de connexion (le jeu freeze puis "Lost connection")
+local lastHeartbeat = tick()
+game:GetService("RunService").Heartbeat:Connect(function()
+	lastHeartbeat = tick()
+end)
+
+-- Watchdog : si on ne reçoit plus de heartbeat pendant 5s, on tente rejoin
+-- (utile pour les kicks silencieux)
+task.spawn(function()
+	while true do
+		task.wait(2)
+		if rejoinArmed and (tick() - lastHeartbeat) > 5 then
+			armRejoin()
+			break
+		end
+	end
+end)
+
+-- 2. Re-exécution automatique du script après rejoin
+-- On stocke le "run script" dans un flag
+local function scheduleAutoExecute()
+	if not savedConfig.AutoExecute then return end
+	if savedConfig.ScriptUrl == "" then return end
+
+	task.spawn(function()
+		task.wait(5) -- attendre que le jeu soit chargé
+		pcall(function()
+			loadstring(game:HttpGet(savedConfig.ScriptUrl))()
+		end)
+	end)
+end
+
+-- Appel au chargement (si on vient de rejoin)
+scheduleAutoExecute()
+
+-- ============================================================
+-- CHARGEMENT DE RAYFIELD
+-- ============================================================
+local Rayfield = loadstring(game:HttpGet('https://sirius.menu/rayfield'))()
+
+local ws = workspace
+local rs = game:GetService("RunService")
+local uis = game:GetService("UserInputService")
+
+local excluded = { "Animals", "Players", "Map" }
+
+local riseStep = 0.08
+local underOffset = 10
+local timeout = 5
+local loopDelay = 1
+local voidPosition = Vector3.new(0, 1000000, 0)
+
+local chests = {}
+local running = false
+local inVoid = false
+
+local function isChest(p)
+	if not p:IsA("BasePart") then return false end
+	if not p:FindFirstChild("TouchInterest") then return false end
+	local m = p.Parent
+	if not m or not m:IsA("Model") then return false end
+	if m.Parent ~= ws then return false end
+	for _, name in ipairs(excluded) do
+		local f = ws:FindFirstChild(name)
+		if f and m:IsDescendantOf(f) then return false end
+	end
+	return true
+end
+
+local function addChest(p)
+	if chests[p] then return end
+
+	for _, c in ipairs(p:GetChildren()) do
+		if c:IsA("Highlight") then c.Enabled = false end
+	end
+
+	local hl = Instance.new("Highlight")
+	hl.FillColor = Color3.fromRGB(255, 215, 0)
+	hl.OutlineColor = Color3.fromRGB(255, 255, 255)
+	hl.FillTransparency = 0.5
+	hl.Parent = p
+
+	local bb = Instance.new("BillboardGui")
+	bb.Size = UDim2.new(0, 120, 0, 20)
+	bb.AlwaysOnTop = true
+	bb.Adornee = p
+	bb.Parent = p
+
+	local lbl = Instance.new("TextLabel")
+	lbl.Size = UDim2.new(1, 0, 1, 0)
+	lbl.BackgroundTransparency = 1
+	lbl.TextColor3 = Color3.new(1, 1, 1)
+	lbl.TextStrokeTransparency = 0
+	lbl.Font = Enum.Font.GothamBold
+	lbl.TextSize = 14
+	lbl.Parent = bb
+
+	chests[p] = { hl = hl, bb = bb, lbl = lbl }
+
+	p.AncestryChanged:Connect(function(_, parent)
+		if not parent then
+			hl:Destroy()
+			bb:Destroy()
+			chests[p] = nil
+		end
+	end)
+
+	p.ChildAdded:Connect(function(c)
+		if c:IsA("Highlight") and c ~= hl then c.Enabled = false end
+	end)
+end
+
+local function scan()
+	for _, d in ipairs(ws:GetDescendants()) do
+		if isChest(d) then addChest(d) end
+	end
+end
+
+ws.DescendantAdded:Connect(function(d)
+	if isChest(d) then addChest(d) end
+end)
+
+rs.Heartbeat:Connect(function()
+	local root = lp.Character and lp.Character:FindFirstChild("HumanoidRootPart")
+	if not root then return end
+
+	for p, data in pairs(chests) do
+		if p.Parent then
+			local dist = (root.Position - p.Position).Magnitude
+			data.lbl.Text = string.format("%s (%dm)", p.Parent.Name, dist)
+		else
+			data.hl:Destroy()
+			data.bb:Destroy()
+			chests[p] = nil
+		end
+	end
+end)
+
+local function countChests()
+	local n = 0
+	for p in pairs(chests) do
+		if p.Parent then n += 1 end
+	end
+	return n
+end
+
+local function enterVoid()
+	local char = lp.Character
+	local root = char and char:FindFirstChild("HumanoidRootPart")
+	if not root then return end
+
+	inVoid = true
+	root.Anchored = true
+	root.CFrame = CFrame.new(voidPosition)
+
+	while running and countChests() == 0 do
+		task.wait(0.5)
+	end
+
+	if root and root.Parent then
+		root.Anchored = false
+	end
+	inVoid = false
+end
+
+local function collect(p)
+	local char = lp.Character
+	local root = char and char:FindFirstChild("HumanoidRootPart")
+	if not (root and p.Parent) then return end
+
+	local origCollide = root.CanCollide
+	root.CanCollide = false
+
+	local targetY = p.Position.Y
+	local start = CFrame.new(p.Position.X, targetY - underOffset, p.Position.Z)
+	root.CFrame = start
+
+	local t0 = tick()
+	local y = start.Position.Y
+
+	while p.Parent and y < targetY and (tick() - t0) < timeout and running do
+		y = math.min(y + riseStep, targetY)
+		root.CFrame = CFrame.new(p.Position.X, y, p.Position.Z)
+		rs.Heartbeat:Wait()
+	end
+
+	if root and root.Parent then
+		root.CanCollide = origCollide
+	end
+end
+
+local function pass()
+	local char = lp.Character
+	local root = char and char:FindFirstChild("HumanoidRootPart")
+	if not root then return end
+
+	local list = {}
+	for p in pairs(chests) do
+		if p.Parent then table.insert(list, p) end
+	end
+
+	table.sort(list, function(a, b)
+		return (root.Position - a.Position).Magnitude < (root.Position - b.Position).Magnitude
+	end)
+
+	for _, p in ipairs(list) do
+		if not running then break end
+		if p.Parent then collect(p) end
+	end
+end
+
+local function loop()
+	running = true
+	while running do
+		if countChests() == 0 then
+			enterVoid()
+		else
+			pass()
+			task.wait(loopDelay)
+		end
+	end
+end
+
+local function stopAutoChest()
+	running = false
+	local char = lp.Character
+	local root = char and char:FindFirstChild("HumanoidRootPart")
+	if root and inVoid then
+		root.Anchored = false
+		inVoid = false
+	end
+end
+
+-- ===== INTERFACE RAYFIELD =====
+local Window = Rayfield:CreateWindow({
+	Name = "Auto Chest",
+	LoadingTitle = "Chargement...",
+	LoadingSubtitle = "by Rayfield",
+	ConfigurationSaving = {
+		Enabled = true,
+		FolderName = "AutoChest",
+		FileName = "Config"
+	},
+	KeySystem = false
+})
+
+local MainTab = Window:CreateTab("Principal", 4483362458)
+
+MainTab:CreateSection("Auto Chest")
+
+local autoChestToggle
+
+autoChestToggle = MainTab:CreateToggle({
+	Name = "Auto Chest",
+	CurrentValue = savedConfig.AutoChest == true,
+	Flag = "AutoChestToggle",
+	Callback = function(Value)
+		savedConfig.AutoChest = Value
+		saveConfig(savedConfig)
+		if Value then
+			task.spawn(loop)
+		else
+			stopAutoChest()
+		end
+	end,
+})
+
+MainTab:CreateSection("Auto Rejoin")
+
+-- Champ pour l'URL du script (nécessaire pour la ré-exécution)
+MainTab:CreateInput({
+	Name = "Script URL (pour auto re-execute)",
+	CurrentValue = savedConfig.ScriptUrl or "",
+	PlaceholderText = "https://pastebin.com/raw/xxxxx",
+	RemoveTextAfterFocusLost = false,
+	Callback = function(Text)
+		savedConfig.ScriptUrl = Text
+		saveConfig(savedConfig)
+	end,
+})
+
+local autoRejoinToggle
+
+autoRejoinToggle = MainTab:CreateToggle({
+	Name = "Auto Rejoin",
+	CurrentValue = savedConfig.AutoRejoin == true,
+	Flag = "AutoRejoinToggle",
+	Callback = function(Value)
+		rejoinArmed = Value
+		savedConfig.AutoRejoin = Value
+		saveConfig(savedConfig)
+		if Value then
+			Rayfield:Notify({
+				Title = "Auto Rejoin",
+				Content = "Activé - reconnexion auto en cas de kick",
+				Duration = 4,
+				Image = 4483362458,
+			})
+		end
+	end,
+})
+
+local autoExecuteToggle = MainTab:CreateToggle({
+	Name = "Auto Re-execute Script",
+	CurrentValue = savedConfig.AutoExecute == true,
+	Flag = "AutoExecuteToggle",
+	Callback = function(Value)
+		savedConfig.AutoExecute = Value
+		saveConfig(savedConfig)
+	end,
+})
+
+-- ============================================================
+-- RESTAURATION DE L'ÉTAT APRÈS REJOIN
+-- ============================================================
+task.spawn(function()
+	task.wait(3) -- laisse le temps au jeu de charger
+	if savedConfig.AutoChest then
+		autoChestToggle:Set(true)
+	end
+	if savedConfig.AutoExecute then
+		-- Si on vient de rejoin, on relance le script depuis l'URL
+		if savedConfig.ScriptUrl and savedConfig.ScriptUrl ~= "" and game.JobId ~= JobId then
+			task.wait(2)
+			pcall(function()
+				loadstring(game:HttpGet(savedConfig.ScriptUrl))()
+			end)
+		end
+	end
+end)
+
+-- Scan initial
+scan()
+
+-- Notification de démarrage
+Rayfield:Notify({
+	Title = "Auto Chest",
+	Content = "Script chargé !",
+	Duration = 5,
+	Image = 4483362458,
+})
